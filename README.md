@@ -7,9 +7,10 @@
 4. [두 기법의 비교](#4-두-기법의-비교)
 5. [시각화 예제](#5-시각화-예제)
 6. [PyTorch 실전 예제 (CIFAR-10 + ResNet18)](#6-pytorch-실전-예제-cifar-10--resnet18)
-7. [실전 조합 전략](#7-실전-조합-전략)
-8. [결론](#8-결론)
-9. [부록: MNIST 교육용 입문 예제](#9-부록-mnist-교육용-입문-예제)
+7. [가지치기가 더 큰 기여를 하는 상황](#7-가지치기가-더-큰-기여를-하는-상황)
+8. [실전 조합 전략](#8-실전-조합-전략)
+9. [결론](#9-결론)
+10. [부록: MNIST 교육용 입문 예제](#10-부록-mnist-교육용-입문-예제)
 
 ---
 
@@ -145,6 +146,27 @@ INT8 가중치: [ 223,   63,  255,   1 ]  (scale ≈ 0.00784, zero_point = 128)
 > **양자화는 "메모리를 줄이고 계산을 빠르게"** 하는 데 강하고,
 > **가지치기는 "실제 연산량(FLOPs)을 줄이는"** 데 강합니다.
 > 실제 배포에서는 **두 기법을 함께 사용**하는 것이 가장 효과적입니다.
+
+### 4.1 저장 크기 · 런타임 메모리 · 연산량은 서로 다른 항목
+
+두 기법을 비교할 때 헛갈리기 쉬운 점은 "크기"라는 말이 세 가지 다른 개념을
+가리킬 수 있다는 것입니다.
+
+| 기법 | 저장 크기(파일) | 런타임 메모리(RAM) | 연산량(FLOPs) |
+|---|---|---|---|
+| 기준 FP32 | 44.9 MB | 높음 | 555 MFLOPs (높음) |
+| 가지치기 30% | 44.9 MB (**동일**) | 비슷~약간 감소 | **감소** (제거된 채널은 연산 스킵) |
+| INT8 양자화 | 11.2 MB (**1/4**) | **1/4로 감소** | 동일, 단 INT8 가속 시 속도↑ |
+
+- **가지치기**는 가중치를 0으로 만들 뿐이라 저장 크기가 그대로지만, 0 값과 제거된
+  채널은 계산에서 빠지므로 **연산량(FLOPs)** 이 줄어듭니다.
+- **양자화**는 저장·메모리 모두 확정적으로 **1/4**로 줄고, 4바이트 대신 1바이트씩
+  읽으므로 **메모리 대역폭**도 1/4로 줄어 실질 속도 향상이 큽니다.
+- 결론적으로 **가지치기 = 연산 공략, 양자화 = 메모리·저장 공략**입니다.
+
+> **주의**: 표만 보면 양자화의 기여가 더 커 보일 수 있습니다. 하지만 이는
+> 예제의 특성(가벼운 30% 가지치기, 정적 지표 위주, 미세조정 생략) 때문입니다.
+> 실제로 가지치기가 훨씬 큰 기여를 하는 상황이 많습니다. → [섹션 7](#7-가지치기가-더-큰-기여를-하는-상황)
 
 ---
 
@@ -356,6 +378,11 @@ print(f"가지치기 후 크기: {fp32_mb:.1f} MB  ← 희소 저장 없으면 �
 줄이고, 양자화는 **메모리를 확정적으로 1/4**로 줄입니다. 가중치만 0으로
 만든 가지치기는 **메모리는 그대로**라는 점이 두 기법의 가장 큰 차이입니다.
 
+> 위 표만 보면 양자화의 기여가 더 커 보일 수 있지만, 이는 **가벼운 30%
+> 가지치기 + 정적 지표 위주 + 미세조정 생략** 때문입니다. 연산/속도가
+> 병목인 실제 Edge 상황에서는 가지치기가 더 큰 기여를 합니다.
+> → [섹션 7: 가지치기가 더 큰 기여를 하는 상황](#7-가지치기가-더-큰-기여를-하는-상황)
+
 ### 6.7 가지치기 → 양자화 결합 파이프라인
 
 ```python
@@ -375,7 +402,189 @@ print("가지치기 → 미세조정 → 양자화 파이프라인 완료")
 
 ---
 
-## 7. 실전 조합 전략
+## 7. 가지치기가 더 큰 기여를 하는 상황
+
+섹션 6의 CIFAR 예제는 30%의 **가벼운 가지치기**와 **정적 지표** 위주라
+양자화의 기여가 커 보였습니다. 하지만 실제 Edge 배포에서는 가지치기가
+훨씬 큰 기여를 하는 상황이 많습니다.
+
+### 7.1 상황별 결정 기준
+
+| 병목 / 환경 | 우세 기법 | 이유 |
+|---|---|---|
+| 지연시간(실시간 처리) 병목 | 가지치기 | 연산량(FLOPs)을 직접 줄임, INT8 가속 불필요 |
+| INT8 미지원 MCU/CPU | 가지치기 | FP32만 가능하면 양자화 유일한 이득은 메모리 1/4뿐 |
+| 과대 파라미터 모델(LLM·생성 모델) | 가지치기 | 30~60% 가지치기 + 미세조정으로 근사 무손실 복구 |
+| 양자화에 민감한 모델 | 가지치기 | 활성화 이상치로 인해 INT8 정확도 손실이 큼 |
+| 메모리/저장 용량이 병목 | 양자화 | 확정적 4배 절감, 구현 단순 |
+| INT8 가속 NPU 탑재 디바이스 | 양자화 | 메모리와 속도를 동시에 얻음 |
+
+### 7.2 예제 A: 실시간 처리(지연시간) 병목 — 채널 슬리밍 + 실측 지연시간
+
+섹션 6에서는 마스크만 씌워 **명목 FLOPs**를 보여줬지만, 여기서는 실제로
+죽은 채널을 제거해 **슬림 네트워크**를 만듭니다. FP32 그대로 연산량이
+줄기 때문에 INT8 하드웨어 없이도 지연시간이 실측으로 줄어듭니다.
+
+```python
+import time
+import torch
+import torch.nn as nn
+from thop import profile
+
+class TinyVGG(nn.Module):
+    """BatchNorm 없이 3개 Conv 블록으로 구성된 소형 CNN (예: 카메라 전처리 모델)"""
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        )
+        self.head = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = self.features(x)
+        return self.head(x.mean(dim=(2, 3)))  # Global Average Pooling
+
+def slim_vgg(model, amount=0.5):
+    """상위 (1-amount) 비율 채널만 남기고 '실제로' 채널을 제거한 슬림 모델 생성"""
+    new_modules, prev_ch = [], 3
+    for m in model.features:
+        if isinstance(m, nn.Conv2d):
+            norms = m.weight.detach().norm(dim=(1, 2, 3))          # 채널별 L2 규범
+            keep = norms >= torch.quantile(norms, amount)          # 살릴 채널 선택
+            idx = keep.nonzero(as_tuple=False).flatten()
+            new_conv = nn.Conv2d(prev_ch, len(idx), m.kernel_size,
+                                 stride=m.stride, padding=m.padding)
+            with torch.no_grad():
+                new_conv.weight.copy_(m.weight[idx])
+                new_conv.bias.copy_(m.bias[idx])
+            new_modules.append(new_conv)
+            prev_ch = len(idx)
+        else:
+            new_modules.append(m)
+    slim = TinyVGG()
+    slim.features = nn.Sequential(*new_modules)
+    slim.head = nn.Linear(prev_ch, 10)
+    return slim
+
+model = TinyVGG()
+slim = slim_vgg(model, amount=0.5)
+
+x = torch.randn(1, 3, 640, 640)  # 예: HD급 프레임을 실시간 처리해야 하는 경우
+flops_full, _ = profile(model, inputs=(x,), verbose=False)
+flops_slim, _ = profile(slim,   inputs=(x,), verbose=False)
+print(f"FLOPs: {flops_full / 1e6:.0f} M → {flops_slim / 1e6:.0f} M "
+      f"({flops_slim / flops_full:.0%})")
+
+def latency(model, iters=30):
+    model.eval()
+    with torch.no_grad():
+        for _ in range(3):
+            model(x)                              # warm-up
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            model(x)
+        return (time.perf_counter() - t0) / iters * 1000  # ms
+
+print(f"지연시간: {latency(model):.1f} ms → {latency(slim):.1f} ms")
+```
+
+**기대 결과** (환경에 따라 다를 수 있는 예시 수치)
+
+| 측정 항목 (640×640 입력) | 원본 TinyVGG | 슬림 TinyVGG(50%) |
+|---|---|---|
+| 연산량 | ~8,300 MFLOPs | ~1,100 MFLOPs (약 1/7) |
+| 지연시간(FP32 CPU) | 210 ms | 30 ms |
+| 30fps(프레임당 33ms) | 불가능 | 가능 |
+
+> 채널을 50% 제거했는데 연산이 1/7로 줄어드는 이유는 **이전 레이어의 입력
+> 채널 수도 함께 줄어들어** 감소 효과가 레이어마다 누적되기 때문입니다.
+
+### 7.3 예제 B: INT8 미지원 하드웨어(MCU) — 양자화의 한계 가시화
+
+INT8 연산 유닛이 없는 MCU/저가 CPU에서는 양자화가 **메모리만 1/4**로 줄이고
+속도는 전혀 개선되지 않습니다. 반면 가지치기는 FP32 그대로 연산을 줄입니다.
+
+```python
+# 예제 A에서 측정한 값(개념 설명용 예시)
+flops_full, flops_slim = 8.3e9, 1.1e9
+
+print(f"양자화: 메모리 4배 절감 | 속도 이득 = {'1.0배 (INT8 유닛 없음 ↔ 가속 불가)'}")
+print(f"가지치기: 연산 {flops_full / flops_slim:.1f}배 절감 "
+      f"→ 속도·전력 소모도 같은 비율로 감소")
+```
+
+| 환경 | 양자화 INT8 | 가지치기 50% |
+|---|---|---|
+| ARM MCU (FP32 전용) | 메모리만 1/4, **속도 변화 없음** | 연산 1/7, 속도·전력 대폭 감소 ★ |
+| NVIDIA Jetson / NPU (INT8 가속) | 메모리 1/4 + 속도 2~4배 ★ | 연산 감소 (가산 적용 시 추가 이득) |
+
+### 7.4 예제 C: 과대 파라미터 모델(Transformer) — 가지치기 + 미세조정
+
+LLM·생성 모델처럼 파라미터가 작업에 필요한 양보다 많은 경우, 가지치기의
+"여유분"이 크고 **미세조정(Fine-tuning)** 을 통해 정확도 복구가 잘 됩니다.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.utils.prune as prune
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
+class TinyTransformer(nn.Module):
+    def __init__(self, vocab=64, d_model=64, nhead=4, n_layers=2, d_ff=128):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d_model)
+        layer = TransformerEncoderLayer(d_model, nhead, d_ff, batch_first=True)
+        self.blocks = TransformerEncoder(layer, n_layers)
+        self.head = nn.Linear(d_model, vocab)
+
+    def forward(self, x):
+        return self.head(self.blocks(self.emb(x)))
+
+model = TinyTransformer()
+
+# FFN 2개 레이어와 출력 헤드를 각각 절반씩 가지치기
+for blk in model.blocks.layers:
+    prune.l1_unstructured(blk.linear1, name="weight", amount=0.5)
+    prune.l1_unstructured(blk.linear2, name="weight", amount=0.5)
+prune.l1_unstructured(model.head, name="weight", amount=0.4)
+
+total = zeros = 0
+for p in model.parameters():
+    total += p.numel()
+    zeros += int((p == 0).sum())
+print(f"전체 희소도: {zeros / total:.1%}")
+```
+
+**핵심 결론**: 이렇게 가지치기된 모델은 **미세조정**으로 원래 성능을 거의
+회복합니다. 대규모 언어 모델에서는 SparseGPT, Wanda, LLM-Pruner 같은
+기법으로 30~60% 가지치기 후 성능 열화를 1% 미만으로 유지하는 것이
+일반적입니다.
+
+> **주의**: 비구조적(가중치 단위) 희소성은 희소 커널을 지원하는 런타임
+> (예: DeepSparse, ONNX 희소 최적화 등)에서만 실질 속도 이득을 보입니다.
+> 저장 이득이 우선이라면 희소 저장(CSR/COO) 형식을 함께 사용하세요.
+
+### 7.5 예제 D: 양자화에 민감한 모델
+
+일부 모델 구조는 활성화 값이 이상치(outlier)를 포함하거나 부호 불균형이라
+INT8 양자화 손실이 특히 큽니다. 이런 모델은 양자화보다 가지치기가 안전합니다.
+
+| 모델 성격 | INT8 양자화 결과 | 가지치기 결과 |
+|---|---|---|
+| MobileNetV1류 depthwise conv | 정확도 -3~5%p 이상 손실 가능 | 미세조정으로 큰 손실 없음 |
+| 활성화에 이상치가 많은 모델 | 양자화 범위 설정 실패 → 오차 증폭 | 이상치 보존 · 안전 |
+| 실시간 연산이 지배적인 모델 | 가속 없으면 무의미 | 연산 직접 감소 ★ |
+
+**요약**: 가지치기가 더 큰 기여를 하는 공통 조건은 **"연산/속도가 병목이고
+INT8 가속이 없거나, 모델이 과대 파라미터라 여유가 크거나, 양자화에
+취약한 구조"** 일 때입니다. 그 외 메모리/저장이 병목이면 양자화가
+지배적입니다.
+
+---
+
+## 8. 실전 조합 전략
 
 Edge AI 배포에서 흔히 사용하는 순서:
 
@@ -402,7 +611,7 @@ Edge AI 배포에서 흔히 사용하는 순서:
 
 ---
 
-## 8. 결론
+## 9. 결론
 
 | | 양자화 | 가지치기 |
 |---|---|---|
@@ -422,7 +631,7 @@ Edge AI 배포에서 흔히 사용하는 순서:
 
 ---
 
-## 9. 부록: MNIST 교육용 입문 예제
+## 10. 부록: MNIST 교육용 입문 예제
 
 본문(섹션 6)에서 CIFAR-10 + ResNet18을 다룬 이유를 다시 짚으면서,
 **기계학습 입문용**으로 가볍게 따라 할 수 있는 MNIST + MLP 코드를 부록으로 제공합니다.
